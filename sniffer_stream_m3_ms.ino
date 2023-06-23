@@ -13,7 +13,7 @@
 //
 // Pulling the stalk for 2s activates "hard-flash" mode. In this mode, pulling
 // the stalk quickly flashes the high beams, for use at track events where
-// slower cars might not see you approaching.
+// slower cars might not see you approaching. This mode deactivates itself after 1h.
 
 
 #define EN1 53 //PB0
@@ -193,6 +193,9 @@ long int model3LastQueryMs;
 long int highBeamsMs=0;
 int highBeamsDurationMs=700;
 
+long int wiperMs=0;
+int wiperDurationMs=2500;
+
 bool hardSignalEnabled=false;
 
 long int hardSignalEnablingMs=0;
@@ -207,8 +210,14 @@ int hardSignalDurationMs=1500;
 int hardSignalFlashIntervalMs=75;
 
 long int disableStalksMs=0;
-int disableStalksDurationMs=100;
+int disableStalksDurationMs=200;
+int lastStalkStatus=0;
 
+long int bootTimeMs=0;
+int bootWarmupMs=5000;
+bool warmedUp=false;
+
+bool sentSilence=false;
 bool debug=false;
 
 byte computeChecksum(byte id, byte data[], int dataLength){
@@ -225,6 +234,8 @@ byte computeChecksum(byte id, byte data[], int dataLength){
 }
 
 void setup() {
+  bootTimeMs=millis();
+  
   // Set LIN1 Write Enable
   pinMode(EN1, OUTPUT);  
   digitalWrite(EN1, HIGH);  
@@ -304,8 +315,17 @@ void handleModel3Lin(){
           model3State = i;
           // Don't clear states when receiving no-button state from the Model 3 wheel. The states are cleared after responding with Model S messages.
           if (i!=0){
-            model3StateL = i;
-            model3StateR = i;
+
+
+            if ((i>=RW_UP && i<=RW_DOWN_MULTI2) && !sentSilence){
+              // In between each RW_UP/RW_DOWN events, send a pause, to have the car perform cruise control speed increase/decrease by 1
+
+              // Don't set the state
+            } else {            
+              model3StateL = i;
+              model3StateR = i;
+              sentSilence=false;
+            }
           }
           break;
         }
@@ -315,6 +335,7 @@ void handleModel3Lin(){
       if (model3Buffer[3+2]>0x16){
         model3StateL = T_HORN;
         model3StateR = T_HORN;
+        sentSilence=false;
       }
 
       if (model3State>0){
@@ -357,6 +378,9 @@ void handleModelSLin(){
             if (model3StateL>0){
               printPacket=true;
             }
+            if (model3StateL==0){
+              sentSilence=true;
+            }
             model3StateL=0;
         } 
 
@@ -369,6 +393,9 @@ void handleModelSLin(){
             if (model3StateR>0){
               printPacket=true;
             }
+            if (model3StateR==0){
+              sentSilence=true;
+            }            
             model3StateR=0;
         } 
 
@@ -402,31 +429,33 @@ void respondModelS(byte data[],int length){
 }
 
 void readModel3Stalk(){
-  
+  long int currentTime = millis();
   int sensorYellow= analogRead(A0);
   int sensorRed= analogRead(A1);
   int sensorWhite= analogRead(A2);
 
-  long int currentTime = millis();
-  if (disableStalksMs>0 && currentTime-disableStalksMs<disableStalksDurationMs){
-    SerialUSB.println("Stalks disabled ...");
-    return;
-  }
-
   bool highBeamAssist=false;
+  bool wiperAssist=false;
       
   bool printState = false;
   if (model3StateL==0 && model3StateR==0){
     printState = true;
   }
 
-  if (currentTime-highBeamsMs<highBeamsDurationMs){
+  if (highBeamsMs>0 && currentTime-highBeamsMs<highBeamsDurationMs){
     highBeamAssist=true;
     model3StateL = ST_LIGHT1;
     model3StateR = ST_LIGHT1;
     if (printState) SerialUSB.println("Lights Assist");
   }
 
+  if (wiperMs>0 && currentTime-wiperMs<wiperDurationMs){
+    wiperAssist=true;
+    model3StateL = ST_WASH1;
+    model3StateR = ST_WASH1;
+    if (printState) SerialUSB.println("Wiper Assist");
+  }
+  
   if (hardSignalEnabled){
     if (currentTime-hardSignalEnabledMs>hardSignalAutoDisableIntervalMs){
       SerialUSB.println("Auto-disabling hard signal");
@@ -461,31 +490,66 @@ void readModel3Stalk(){
     model3StateR = ST_WASH1;
   } else if (sensorYellow>175 && sensorYellow<340){
     if (printState) SerialUSB.println("Wash2");
+    wiperMs = currentTime;
     model3StateL = ST_WASH2;
-    model3StateR = ST_WASH2;    
-  } else if (sensorRed>650 && sensorRed<720){
+    model3StateR = ST_WASH2;
+  } else if (sensorRed>=705 && sensorRed<725){
+    bool detectedStalkConflict=false;
+    if (disableStalksMs>0 && currentTime-disableStalksMs<disableStalksDurationMs){
+      // Disable conflicting stalk status for a short period after a turn signal message, to avoid false-readouts
+      int remainingDisabledTimeMs = disableStalksDurationMs - (currentTime-disableStalksMs);
+      if (lastStalkStatus==ST_BLINK_RIGHT1){
+        detectedStalkConflict=true;
+      }
+    }
+      
     if (printState) SerialUSB.println("Down1");
-    model3StateL = ST_BLINK_LEFT1;
-    model3StateR = ST_BLINK_LEFT1;    
-  } else if (sensorRed>950){
+    if (!detectedStalkConflict){
+      model3StateL = ST_BLINK_LEFT1;
+      model3StateR = ST_BLINK_LEFT1;     
+      disableStalksMs = currentTime;
+      lastStalkStatus = model3StateL;
+    } else {
+      if (printState) SerialUSB.println("Disabled, state chaged too fast...");
+    }
+  } else if (sensorRed>1020){
     if (printState) SerialUSB.println("Down2");
     model3StateL = ST_BLINK_LEFT1;
     model3StateR = ST_BLINK_LEFT1;  
-  } else if (sensorRed<50){    
+    disableStalksMs = currentTime;
+    lastStalkStatus = model3StateL;
+  } else if (sensorRed<10){    
+
+    bool detectedStalkConflict=false;
+    if (disableStalksMs>0 && currentTime-disableStalksMs<disableStalksDurationMs){
+      // Disable conflicting stalk status for a short period after a turn signal message, to avoid false-readouts
+      int remainingDisabledTimeMs = disableStalksDurationMs - (currentTime-disableStalksMs);
+      if (lastStalkStatus==ST_BLINK_LEFT1){
+        detectedStalkConflict=true;
+      }
+    }
+      
     if (printState) SerialUSB.println("Up1");
-    model3StateL = ST_BLINK_RIGHT1;
-    model3StateR = ST_BLINK_RIGHT1;    
-  } else if (sensorRed>550 && sensorRed<650){
+    if (!detectedStalkConflict){
+      model3StateL = ST_BLINK_RIGHT1;
+      model3StateR = ST_BLINK_RIGHT1;   
+      disableStalksMs = currentTime;
+      lastStalkStatus = model3StateL;
+    } else {
+      if (printState) SerialUSB.println("Disabled, state chaged too fast...");    
+    }   
+  } else if (sensorRed>590 && sensorRed<610){
     if (printState) SerialUSB.println("Up2");
     model3StateL = ST_BLINK_RIGHT1;
     model3StateR = ST_BLINK_RIGHT1; 
+    disableStalksMs = currentTime;
+    lastStalkStatus = model3StateL;
   } else if (sensorWhite>75 && sensorWhite<200){
     if (printState) SerialUSB.println("Lights1");
     model3StateL = ST_LIGHT1;
     model3StateR = ST_LIGHT1;
     highBeamsMs = currentTime;
   } else if (sensorWhite>200 && sensorWhite<400){
-
     if (hardSignalEnablingInProgress){
       // check if enough time passed
       if (currentTime-hardSignalEnablingMs>hardSignalEnablingDurationMs){
@@ -502,8 +566,7 @@ void readModel3Stalk(){
         if (hardSignalEnabled){  
           hardSignalEnabledMs = currentTime;
           hardSignalActivatedMs = currentTime;
-        }
-        disableStalksMs = currentTime;        
+        }               
       }
     } else {
       SerialUSB.println("Starting Hard Signal Toggle. ");
@@ -539,9 +602,9 @@ void readModel3Stalk(){
 void loop() {
   int count=0;
   int wheelDataPosition=-1;
-
     
   long int currentTime = millis();
+    
   if (currentTime-model3LastQueryMs>model3QueryIntervalMs){
     model3LastQueryMs=currentTime;
     queryModel3();
@@ -549,5 +612,15 @@ void loop() {
   
   handleModel3Lin();
   readModel3Stalk();
-  handleModelSLin();
+
+  if (currentTime-bootTimeMs>bootWarmupMs){    
+    warmedUp=true;    
+  }
+  
+  if (warmedUp){
+    // Don't send messages right away after boot, to avoid high beams or horn activation right after boot
+    handleModelSLin();
+  } else {
+    SerialUSB.println("Warming up ...");
+  }
 }
